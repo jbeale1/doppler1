@@ -7,4 +7,4 @@ Using a log Y axis, the deviation from the normal curve is more visible, with th
 
 ![Speed histogram](hist_plot_91k.png)
 
-In the histogram I label the set of events under the dotted-line gaussian curve (fit to the [18,36] mph interval) as **Na** and the points above and to the right of the curve (higher than the curve peak at 25.9 mph) as **Nb**. In this dataset **Na** (fits Gaussian) = 89683 events and **Nb** (excess above fit on high side) = 1628. The sum (89683+1628)=91311 so there are 1628/91311 = 1.78% of the combined set that is the fraction of traffic faster than the normal fit would predict.
+In the histogram I label the set of events under the dotted-line gaussian curve (fit to the [18,36] mph interval) as **Na** and the points above and to the right of the curve (higher than the curve peak at 25.9 mph) as **Nb**. In this dataset **Na** (fits Gaussian) = 89683 events and **Nb** (excess above fit on high side) = 1628. The sum (89683+1628)=91311 so the quantity 1628/91311 = **1.8%** of the combined set is the fraction of traffic faster than the normal fit would predict.
