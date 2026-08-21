@@ -1,6 +1,7 @@
 This project records data from a doppler radar traffic speed sensor (HLK-LD2415H) and presents views of the statistics across multiple days. The location is a residential street which had been posted at 25 mph for many decades, but in Nov. 2025 was switched to 20 mph. This data is all from 2026.
 
 A histogram of measured speed using 161 days of data (~91k traffic events) shows the speed distribution is nearly normal.
+
 ![Speeds](histogram_linear.png)
 
 Using a log Y axis, the deviation from the normal curve is more visible, with the faster traffic extending beyond the curve. There is just under 2% of traffic that falls above and to the right of the best-fit model gaussian. This forms an excess on the high-speed side that does not match a single-population normal curve model.
