@@ -19,7 +19,7 @@ OUTPUT_DIR = '/dev/shm/D1'      # tmpfs directory to log data in (RAM-backed)
 REMOTE_DEST = "jbeale@jbeale-mini.local:/mnt/bluecherry/DOPPLER1/"
 FILE_PREFIX = 'doppler1_env_daily_'  # -> doppler1_env_daily_YYYYMMDD.csv
 
-VERSION = "1.0.0 (readRH.py: daily-rotated CSV, hourly push)"
+VERSION = "1.1.0 (readRH.py: self-healing day-rotation, hourly loop can't die silently)"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -93,9 +93,9 @@ def _finalize_and_rotate():
         if _csv_file is not None:
             old_path = _csv_file.name
             _csv_file.close()
-        day_str = time.strftime("%Y%m%d")  # local date, now that midnight has passed
+        day_str = time.strftime("%Y%m%d")  # local date, now that the day has changed
         fname = _open_env_csv(day_str)
-        print(f"[daily] midnight rotation -> now logging to {fname}")
+        print(f"[daily] day rollover -> now logging to {fname}")
 
     if old_path is not None:
         _transfer_queue.put(old_path)
@@ -103,20 +103,36 @@ def _finalize_and_rotate():
 
 
 def _hourly_push_loop():
+    """Runs forever in a daemon thread. Rotation is detected by comparing
+    the actual current date against the date of the currently-open file
+    (not by trying to catch the exact instant tm_hour==0) -- so a missed,
+    delayed, or early wake-up still self-corrects on the very next
+    iteration instead of leaving the file un-rotated for the rest of the
+    day. The entire loop body is wrapped in try/except: an uncaught
+    exception here would otherwise silently kill this daemon thread while
+    the main sensor-read loop keeps running none the wiser -- this is
+    exactly the bug found and fixed in dlog1.py (same architecture),
+    where rotation and hourly pushes just stopped one day with no crash
+    and no visible error."""
     while True:
-        time.sleep(_seconds_until_next_local_hour())
-
-        if time.localtime().tm_hour == 0:
-            _finalize_and_rotate()
-            continue
-
-        with _csv_lock:
-            path = _csv_path
-            if path is not None and _csv_file is not None:
-                _csv_file.flush()
-        if path is None or not os.path.exists(path):
-            continue
         try:
+            time.sleep(_seconds_until_next_local_hour())
+
+            today_str = time.strftime("%Y%m%d")
+            with _csv_lock:
+                open_file_day = os.path.basename(_csv_path)[len(FILE_PREFIX):len(FILE_PREFIX) + 8] \
+                    if _csv_path else None
+
+            if open_file_day != today_str:
+                _finalize_and_rotate()
+                continue
+
+            with _csv_lock:
+                path = _csv_path
+                if path is not None and _csv_file is not None:
+                    _csv_file.flush()
+            if path is None or not os.path.exists(path):
+                continue
             result = subprocess.run(
                 ['rsync', '-a', path, REMOTE_DEST],
                 capture_output=True, text=True, timeout=30
@@ -126,7 +142,8 @@ def _hourly_push_loop():
             else:
                 print(f"[hourly push] pushed {path} -> {REMOTE_DEST} (local copy kept)")
         except Exception as e:
-            print(f"[hourly push] error: {e}")
+            print(f"[hourly push loop] error (thread continues): {e}")
+            time.sleep(60)  # avoid a tight error loop if something's persistently broken
 
 
 def write_env_row(t_start, t_mean, rh_mean):
