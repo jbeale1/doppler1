@@ -4,10 +4,11 @@ doppler_db_build.py -- build/update the DOPPLER1 events database.
 
 Scans all doppler1_speed_daily_*.csv files in DATA_DIR and (re)computes
 tracks for any day whose source file is new or has changed (by mtime+size)
-since it was last processed. Today's date is ALWAYS reprocessed, since that
-file keeps growing throughout the day. Safe to run repeatedly -- unchanged
-historical days are skipped, so incremental runs after the first full
-backfill are fast.
+since it was last processed - including today's, whose file keeps growing
+throughout the day, so its changing size naturally triggers reprocessing
+each time new samples land. A run where nothing has changed since the last
+one (any day, including today) does no CSV parsing or resegmentation at
+all, just one os.stat() per day. Safe to run repeatedly.
 
 Usage:
     python3 doppler_db_build.py               # incremental update
@@ -41,7 +42,6 @@ def main():
 
     conn = db.get_connection()
     days = dc.list_available_days()
-    today = dc.today_str()
 
     n_processed = 0
     n_skipped = 0
@@ -53,7 +53,6 @@ def main():
         existing = db.get_day_record(conn, day_str)
         needs_update = (
             args.full
-            or day_str == today
             or existing is None
             or existing["source_mtime"] != mtime
             or existing["source_size"] != size

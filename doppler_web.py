@@ -18,7 +18,9 @@ existing web server (e.g. a bird-call page on port 5000).
 """
 
 import math
+import os
 import re
+import sqlite3
 from datetime import datetime
 from io import BytesIO
 
@@ -32,6 +34,19 @@ import doppler_common as dc
 import doppler_db as db
 
 PORT = 5001
+
+# Root folder of CAMA per-day image folders (YYYYMMDD subfolders), on this
+# same machine (jbeale-mini.local), used to serve /cama_image/<filename>.
+CAMA_IMAGE_DIR = "/mnt/bluecherry/CAMA"
+
+CAMA_FILENAME_RE = re.compile(r"^(\d{8})_\d{6}_\d{3}_\d+\.jpg$", re.IGNORECASE)
+
+# Read-only lookups for the /lidar_compare page, which reports coverage
+# across all three sensor databases. Missing/locked (e.g. a concurrent
+# cron write) is handled gracefully rather than crashing the page - see
+# _safe_connect().
+LIDAR_DB_PATH = "/mnt/bluecherry/LIDAR3/lidar3_events.db"
+CAMA_DB_PATH = "/mnt/bluecherry/CAMA/cama_images.db"
 
 app = Flask(__name__)
 
@@ -47,6 +62,12 @@ def get_day_tracks(day_str):
     try:
         if db.has_day(conn, day_str):
             events = db.query_events(conn, date_from=day_str, date_to=day_str, min_duration=None)
+            event_ids = [e.get("id") for e in events]
+            cama_labels = db.get_cama_labels(conn, event_ids)
+            lidar_labels = db.get_lidar_labels(conn, event_ids)
+            for e in events:
+                e["cama_label"] = cama_labels.get(e.get("id"))
+                e["lidar_label"] = lidar_labels.get(e.get("id"))
             return events, True
     finally:
         conn.close()
@@ -56,7 +77,108 @@ def get_day_tracks(day_str):
         return [], False
     tracks = dc.segment_tracks(df)
     tracks = [t for t in tracks if t["max_mph"] <= dc.MAX_PLAUSIBLE_SPEED_MPH]
+    for t in tracks:
+        t["cama_label"] = None  # not in the events table yet -> no label possible
+        t["lidar_label"] = None
     return tracks, True
+
+
+# ---------------------------------------------------------------------------
+# LIDAR3 <-> DOPPLER1 comparison (/lidar_compare)
+# ---------------------------------------------------------------------------
+def _safe_connect(path):
+    """Open another station's database read-only-ish; returns None (rather
+    than raising) if it's missing or briefly locked by a concurrent cron
+    write, so this page degrades gracefully instead of crashing."""
+    try:
+        conn = sqlite3.connect(path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def _stats_for(vals):
+    if not vals:
+        return None
+    n = len(vals)
+    mean = sum(vals) / n
+    var = sum((v - mean) ** 2 for v in vals) / n
+    s = sorted(vals)
+    median = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    return {"n": n, "mean": mean, "median": median, "std": var ** 0.5,
+            "min": s[0], "max": s[-1]}
+
+
+def compute_speed_comparison_rows(conn):
+    """One row per (type, direction) group, PLUS a direction=None row per
+    type combining both directions - flat list, easy to render as a
+    table. speed_diff_mph is (lidar - doppler), already computed per-row
+    at match time using whichever doppler field (median for pedestrians,
+    max for vehicles) represents the same target LIDAR measured."""
+    rows = conn.execute("""
+        SELECT l.lidar_type, e.direction AS dop_dir, l.speed_diff_mph
+        FROM lidar_labels l JOIN events e ON e.id = l.doppler_event_id
+        WHERE l.speed_diff_mph IS NOT NULL
+    """).fetchall()
+
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["lidar_type"], None), []).append(r["speed_diff_mph"])
+        groups.setdefault((r["lidar_type"], r["dop_dir"]), []).append(r["speed_diff_mph"])
+
+    out = []
+    for (t, d), vals in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
+        s = _stats_for(vals)
+        if s:
+            out.append({"type": t, "direction": d, **s})
+    return out
+
+
+def compute_coverage(doppler_conn, lidar_conn, cama_conn):
+    total_doppler = doppler_conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    with_lidar = doppler_conn.execute(
+        "SELECT COUNT(DISTINCT doppler_event_id) FROM lidar_labels").fetchone()[0]
+    with_cama = doppler_conn.execute(
+        "SELECT COUNT(DISTINCT doppler_event_id) FROM cama_labels").fetchone()[0]
+    with_both = doppler_conn.execute("""
+        SELECT COUNT(*) FROM events e
+        WHERE EXISTS (SELECT 1 FROM lidar_labels l WHERE l.doppler_event_id = e.id)
+          AND EXISTS (SELECT 1 FROM cama_labels c WHERE c.doppler_event_id = e.id)
+    """).fetchone()[0]
+    lidar_matched_with_cama_too = doppler_conn.execute("""
+        SELECT COUNT(*) FROM lidar_labels l
+        WHERE EXISTS (SELECT 1 FROM cama_labels c WHERE c.doppler_event_id = l.doppler_event_id)
+    """).fetchone()[0]
+
+    result = {
+        "total_doppler": total_doppler,
+        "doppler_with_lidar": with_lidar,
+        "doppler_with_cama": with_cama,
+        "doppler_with_both": with_both,
+        "doppler_with_neither": total_doppler - (with_lidar + with_cama - with_both),
+        "lidar_matched_with_cama_too": lidar_matched_with_cama_too,
+        "total_lidar": None, "lidar_matched_to_doppler": None, "lidar_unmatched": None,
+        "total_cama": None, "cama_matched_to_doppler": None, "cama_unmatched": None,
+    }
+
+    if lidar_conn is not None:
+        total_lidar = lidar_conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        matched_lidar_ids = doppler_conn.execute(
+            "SELECT COUNT(DISTINCT lidar_event_id) FROM lidar_labels").fetchone()[0]
+        result["total_lidar"] = total_lidar
+        result["lidar_matched_to_doppler"] = matched_lidar_ids
+        result["lidar_unmatched"] = total_lidar - matched_lidar_ids
+
+    if cama_conn is not None:
+        total_cama = cama_conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        matched_cama_ids = doppler_conn.execute(
+            "SELECT COUNT(DISTINCT cama_id) FROM cama_labels").fetchone()[0]
+        result["total_cama"] = total_cama
+        result["cama_matched_to_doppler"] = matched_cama_ids
+        result["cama_unmatched"] = total_cama - matched_cama_ids
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +263,7 @@ DAY_TEMPLATE = BASE_CSS + """
   <a href="{{ url_for('day_view', day_str=next_day) }}">next day &rarr;</a>
   <a href="{{ url_for('days_list') }}">browse all days</a>
   <a href="{{ url_for('stats_day', day_str=day_str) }}">full stats for this day &rarr;</a>
+  <a href="{{ url_for('lidar_compare') }}">LIDAR3 comparison &rarr;</a>
 </div>
 
 {% if is_today %}
@@ -164,8 +287,12 @@ DAY_TEMPLATE = BASE_CSS + """
     <th>Dir</th>
     <th>Type</th>
     <th><a href="{{ url_for('day_view', day_str=day_str, sort='speed', dir=headers.speed.next_dir) }}">Max speed{{ headers.speed.arrow }}</a></th>
+    <th>Median speed</th>
     <th><a href="{{ url_for('day_view', day_str=day_str, sort='duration', dir=headers.duration.next_dir) }}">Duration{{ headers.duration.arrow }}</a></th>
+    <th>Distance</th>
     <th>Samples</th>
+    <th>LIDAR speed</th>
+    <th>Image</th>
     <th></th>
   </tr>
   {% for t in tracks %}
@@ -173,10 +300,25 @@ DAY_TEMPLATE = BASE_CSS + """
     <td>{{ loop.index }}</td>
     <td>{{ local_time_str(t.start_epoch) }}</td>
     <td class="{{ t.direction }}">{{ t.direction }}</td>
-    <td>{{ t.type }}</td>
+    <td>{{ t.type }}{% if t.overlap_split %} <span title="Two opposite-direction vehicles overlapped closely enough in time that this track was split out of a merged detection - direction/speed for this half may be less certain than usual.">&#8646;</span>{% endif %}</td>
     <td>{{ "%.1f"|format(t.max_mph) }} mph{% if t.artifact_flag %} <span title="Raw data included what looks like a sensor artifact (a run of identical readings plus a physically implausible jump); those points were excluded from this max-speed calculation. Expand the plot to see them marked.">&#9888;</span>{% endif %}</td>
+    <td>{% if t.median_mph is not none %}{{ "%.1f"|format(t.median_mph) }} mph{% endif %}</td>
     <td>{{ "%.1f"|format(t.duration_s) }} s</td>
+    <td>{% if t.track_distance_ft is not none %}{{ "%.0f"|format(t.track_distance_ft) }} ft{% endif %}</td>
     <td>{{ t.n_samples }}</td>
+    <td>
+      {% if t.lidar_label %}
+      <span title="LIDAR3 gate ({{ t.lidar_label.type }}), {{ '%.2f'|format(t.lidar_label.delta_s) }}s offset, compared against doppler {{ t.lidar_label.dop_compare_field }} ({{ '%+.1f'|format(t.lidar_label.speed_diff_mph) if t.lidar_label.speed_diff_mph is not none else 'n/a' }} mph diff)">
+        {{ "%.1f"|format(t.lidar_label.speed_avg_mph) }} mph
+      </span>
+      {% endif %}
+    </td>
+    <td>
+      {% if t.cama_label %}
+      <a href="{{ url_for('cama_image', filename=t.cama_label.filename) }}" target="_blank"
+         title="matched CAMA image, {{ '%.2f'|format(t.cama_label.delta_s) }}s offset">photo</a>
+      {% endif %}
+    </td>
     <td class="plotcell">
       <details ontoggle="togglePlot({{ t.idx }})">
         <summary>&#9654;</summary>
@@ -184,7 +326,7 @@ DAY_TEMPLATE = BASE_CSS + """
     </td>
   </tr>
   <tr class="plotrow" id="plotrow-{{ t.idx }}" style="display:none;">
-    <td colspan="8">
+    <td colspan="12">
       <img class="trackplot" loading="lazy"
            src="{{ url_for('track_plot', day_str=day_str, track_idx=t.idx) }}">
     </td>
@@ -201,7 +343,9 @@ DAYS_LIST_TEMPLATE = BASE_CSS + """
 <div class="nav">
   <a href="{{ url_for('index') }}">today</a>
   <a href="{{ url_for('stats_range') }}">date-range stats</a>
+  <a href="{{ url_for('lidar_compare') }}">LIDAR3 comparison</a>
 </div>
+<p class="stats">{{ n_db_days }} day{{ 's' if n_db_days != 1 else '' }} currently in the database</p>
 <div class="daylist">
 {% for d in days %}
   <a href="{{ url_for('day_view', day_str=d) }}">{{ d }}</a>
@@ -219,17 +363,20 @@ STATS_TEMPLATE = BASE_CSS + """
 
 <form class="rangeform" method="get" action="{{ url_for('stats_range') }}">
   from <input type="text" name="start" placeholder="YYYYMMDD" value="{{ start or '' }}">
-  to <input type="text" name="end" placeholder="YYYYMMDD" value="{{ end or '' }}">
+  to <input type="text" name="end" placeholder="YYYYMMDD (default: today)" value="{{ end or '' }}">
   time-of-day
   <input type="text" name="start_time" placeholder="HH:MM" value="{{ start_time or '' }}" style="width:5em;">
   to
   <input type="text" name="end_time" placeholder="HH:MM" value="{{ end_time or '' }}" style="width:5em;">
   <button type="submit">go</button>
+  {% if all_days_start and all_days_end %}
+  <a href="{{ url_for('stats_range', start=all_days_start, end=all_days_end) }}">all available days</a>
+  {% endif %}
 </form>
 {% if time_error %}<p style="color:#b91c1c;">{{ time_error }}</p>{% endif %}
 
 {% if stats %}
-<p>Data period: {{ start_str }} to {{ end_str }}  ({{ "%.2f"|format(stats.period_hours) }} hours)</p>
+<p>Data period: {{ start_str }} to {{ end_str }}  ({{ "%.2f"|format(stats.period_hours) }} hours, {{ stats.n_days }} day{{ 's' if stats.n_days != 1 else '' }})</p>
 {% if start_time or end_time %}<p>Time-of-day filter: {{ start_time or '00:00' }} to {{ end_time or '23:59:59' }} (each day)</p>{% endif %}
 
 <h3>Summary (by direction / type)</h3>
@@ -377,6 +524,74 @@ STATS_TEMPLATE = BASE_CSS + """
 {% endif %}
 """
 
+LIDAR_COMPARE_TEMPLATE = BASE_CSS + """
+<h1>DOPPLER1 &harr; LIDAR3 comparison</h1>
+<div class="nav">
+  <a href="{{ url_for('index') }}">today</a>
+  <a href="{{ url_for('days_list') }}">browse all days</a>
+</div>
+<p class="stats">
+  All-time, from whatever history each database currently has processed.
+  speed diff = LIDAR &minus; DOPPLER1 (positive means LIDAR read faster).
+</p>
+
+<h3>Speed agreement</h3>
+<table>
+  <tr>
+    <th>Type</th><th>Direction</th><th>n</th><th>mean diff</th><th>median diff</th>
+    <th>std dev</th><th>min</th><th>max</th>
+  </tr>
+  {% for r in speed_rows %}
+  <tr>
+    <td>{{ r.type }}</td>
+    <td class="{{ r.direction or '' }}">{{ r.direction or 'all' }}</td>
+    <td>{{ r.n }}</td>
+    <td>{{ "%+.2f"|format(r.mean) }}</td>
+    <td>{{ "%+.2f"|format(r.median) }}</td>
+    <td>{{ "%.2f"|format(r.std) }}</td>
+    <td>{{ "%.1f"|format(r.min) }}</td>
+    <td>{{ "%.1f"|format(r.max) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if not speed_rows %}<p>No matched LIDAR/DOPPLER1 events with a speed comparison yet.</p>{% endif %}
+
+<h3>Speed scatter</h3>
+<img class="trackplot" loading="lazy" style="max-width:420px;"
+     src="{{ url_for('lidar_compare_scatter', type='vehicle') }}">
+<img class="trackplot" loading="lazy" style="max-width:420px;"
+     src="{{ url_for('lidar_compare_scatter', type='pedestrian') }}">
+
+<h3>Coverage</h3>
+<table>
+  <tr><th>DOPPLER1 events (total)</th><td>{{ coverage.total_doppler }}</td></tr>
+  <tr><th>&nbsp;&nbsp;with a LIDAR3 match</th><td>{{ coverage.doppler_with_lidar }}</td></tr>
+  <tr><th>&nbsp;&nbsp;with a CAMA photo</th><td>{{ coverage.doppler_with_cama }}</td></tr>
+  <tr><th>&nbsp;&nbsp;with both</th><td>{{ coverage.doppler_with_both }}</td></tr>
+  <tr><th>&nbsp;&nbsp;with neither</th><td>{{ coverage.doppler_with_neither }}</td></tr>
+  <tr><th>LIDAR3 events matched to a DOPPLER1 event that also has a CAMA photo</th>
+      <td>{{ coverage.lidar_matched_with_cama_too }}</td></tr>
+  <tr><th>LIDAR3 events (total)</th>
+      <td>{{ coverage.total_lidar if coverage.total_lidar is not none else 'unavailable' }}</td></tr>
+  <tr><th>&nbsp;&nbsp;matched to a DOPPLER1 event</th>
+      <td>{{ coverage.lidar_matched_to_doppler if coverage.lidar_matched_to_doppler is not none else '-' }}</td></tr>
+  <tr><th>&nbsp;&nbsp;unmatched</th>
+      <td>{{ coverage.lidar_unmatched if coverage.lidar_unmatched is not none else '-' }}</td></tr>
+  <tr><th>CAMA images (total)</th>
+      <td>{{ coverage.total_cama if coverage.total_cama is not none else 'unavailable' }}</td></tr>
+  <tr><th>&nbsp;&nbsp;matched to a DOPPLER1 event</th>
+      <td>{{ coverage.cama_matched_to_doppler if coverage.cama_matched_to_doppler is not none else '-' }}</td></tr>
+  <tr><th>&nbsp;&nbsp;unmatched</th>
+      <td>{{ coverage.cama_unmatched if coverage.cama_unmatched is not none else '-' }}</td></tr>
+</table>
+{% if coverage.total_lidar is none or coverage.total_cama is none %}
+<p style="color:#888; font-size:0.9em;">
+  Some totals show "unavailable" - the corresponding database couldn't be reached just now
+  (missing, or briefly locked by a concurrent write). Reload to retry.
+</p>
+{% endif %}
+"""
+
 
 def render_stats_page(events, label, day_str=None, start=None, end=None,
                        start_time=None, end_time=None, time_error=None, top_n=20):
@@ -398,6 +613,12 @@ def render_stats_page(events, label, day_str=None, start=None, end=None,
         exceedance = dc.compute_exceedance(events)
         top_vehicle_events = dc.top_events(events, obj_type="vehicle", n=top_n)
 
+    known = db.get_connection()
+    known_days = db.known_days(known)
+    known.close()
+    all_days_start = min(known_days) if known_days else None
+    all_days_end = max(known_days) if known_days else None
+
     return render_template_string(
         STATS_TEMPLATE,
         label=label, day_str=day_str, start=start, end=end,
@@ -409,6 +630,7 @@ def render_stats_page(events, label, day_str=None, start=None, end=None,
         percentiles=[p for p in dc.PERCENTILES if p != 50],
         exceedance=exceedance, top_vehicle_events=top_vehicle_events,
         time_fmt=time_fmt, time_col_label=time_col_label,
+        all_days_start=all_days_start, all_days_end=all_days_end,
     )
 
 
@@ -442,7 +664,11 @@ def build_sort_headers(sort_key, sort_dir):
 
 @app.route("/days")
 def days_list():
-    return render_template_string(DAYS_LIST_TEMPLATE, days=dc.list_available_days(), data_dir=dc.DATA_DIR)
+    conn = db.get_connection()
+    n_db_days = len(db.known_days(conn))
+    conn.close()
+    return render_template_string(DAYS_LIST_TEMPLATE, days=dc.list_available_days(),
+                                   data_dir=dc.DATA_DIR, n_db_days=n_db_days)
 
 
 @app.route("/day/<day_str>")
@@ -525,7 +751,7 @@ def stats_day(day_str):
 @app.route("/stats_range")
 def stats_range():
     start = request.args.get("start", "").strip()
-    end = request.args.get("end", "").strip()
+    end = request.args.get("end", "").strip() or dc.today_str()
     start_time = request.args.get("start_time", "").strip() or None
     end_time = request.args.get("end_time", "").strip() or None
     time_error = None
@@ -745,6 +971,76 @@ def speed_histogram():
     plt.close(fig)
     buf.seek(0)
     return send_file(buf, mimetype="image/png")
+
+
+@app.route("/lidar_compare")
+def lidar_compare():
+    conn = db.get_connection()
+    speed_rows = compute_speed_comparison_rows(conn)
+
+    lidar_conn = _safe_connect(LIDAR_DB_PATH)
+    cama_conn = _safe_connect(CAMA_DB_PATH)
+    coverage = compute_coverage(conn, lidar_conn, cama_conn)
+    conn.close()
+    if lidar_conn is not None:
+        lidar_conn.close()
+    if cama_conn is not None:
+        cama_conn.close()
+
+    return render_template_string(LIDAR_COMPARE_TEMPLATE, speed_rows=speed_rows, coverage=coverage)
+
+
+@app.route("/lidar_compare_scatter.png")
+def lidar_compare_scatter():
+    obj_type = request.args.get("type", "vehicle")
+    if obj_type not in ("vehicle", "pedestrian"):
+        obj_type = "vehicle"
+
+    conn = db.get_connection()
+    rows = conn.execute("""
+        SELECT l.lidar_speed_avg_mph,
+               CASE WHEN l.dop_compare_field='median_mph' THEN e.median_mph ELSE e.max_mph END AS dop_speed
+        FROM lidar_labels l JOIN events e ON e.id = l.doppler_event_id
+        WHERE l.lidar_type = ?
+    """, (obj_type,)).fetchall()
+    conn.close()
+
+    lidar_speeds = [r["lidar_speed_avg_mph"] for r in rows if r["dop_speed"] is not None]
+    dop_speeds = [r["dop_speed"] for r in rows if r["dop_speed"] is not None]
+
+    fig, ax = plt.subplots(figsize=(4.8, 4.8))
+    if lidar_speeds:
+        ax.scatter(lidar_speeds, dop_speeds, s=10, alpha=0.35, color="#1d4ed8", zorder=2)
+        lo = min(min(lidar_speeds), min(dop_speeds))
+        hi = max(max(lidar_speeds), max(dop_speeds))
+        ax.plot([lo, hi], [lo, hi], color="#e11d48", linewidth=1, linestyle="--",
+                label="y = x", zorder=3)
+        ax.legend(fontsize=8, loc="upper left")
+    ax.set_xlabel("LIDAR3 speed (mph)")
+    ax.set_ylabel("DOPPLER1 speed (mph)")
+    ax.set_title(f"{obj_type} (n={len(lidar_speeds)})", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    if lidar_speeds:
+        ax.set_aspect("equal", adjustable="box")
+    fig.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
+
+
+@app.route("/cama_image/<filename>")
+def cama_image(filename):
+    m = CAMA_FILENAME_RE.match(filename)
+    if not m:
+        abort(404)
+    day_str = m.group(1)
+    path = os.path.join(CAMA_IMAGE_DIR, day_str, filename)
+    if not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="image/jpeg")
 
 
 @app.route("/plot/<day_str>/<int:track_idx>.png")

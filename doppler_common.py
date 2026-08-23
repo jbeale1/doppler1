@@ -48,6 +48,7 @@ SIGN_LABELS = {-1: "east", 1: "west"}
 
 KMH_PER_MPH = 1.60934
 KMH_TO_MPS = 1.0 / 3.6
+FT_PER_MPH_S = 5280.0 / 3600.0  # 1 mph = this many feet/second
 
 # Speed below which a track is classified "pedestrian" rather than
 # "vehicle" -- same convention used for the LIDAR station matching (an
@@ -92,6 +93,40 @@ MAX_PLAUSIBLE_ACCEL_MPS2 = 10.0      # ~1g -- a transition into/out of a suspici
 ARTIFACT_MAX_SPEED_IMPACT_MPH = 2.0  # only visibly flag a track (vs. just quietly excluding the
                                       # points) if doing so actually changed the reported max
                                       # speed by more than this
+
+# General coherence check, applied across EVERY consecutive raw-sample pair
+# in a candidate track (unlike detect_artifact_mask() above, which only
+# checks this same MAX_PLAUSIBLE_ACCEL_MPS2 bound at the edges of a
+# stuck-value run). A single vehicle or pedestrian accelerates/decelerates
+# smoothly; readings that repeatedly swing wildly (e.g. 3 -> 36 -> 3 -> 74
+# mph within a couple of samples) aren't a coherent single target at all --
+# more likely electronic interference or another unreliable source. A FEW
+# implausible jumps are normal and expected, especially right at a track's
+# start/end where signal is weakest (a long good track will dilute a
+# couple of noisy edge samples to a low percentage); what distinguishes
+# real noise is a HIGH PROPORTION of the whole track being incoherent, not
+# a fixed count. Checked against two real all-noise examples (29% and 52%
+# implausible pairs) vs. a realistic good track with ordinary edge noise
+# (~4%) -- there's a wide, clean gap between those, which is what these
+# two constants are chosen to sit inside.
+MAX_IMPLAUSIBLE_JUMP_FRACTION = 0.20   # reject if implausible jumps exceed this share of pairs
+MIN_IMPLAUSIBLE_JUMPS_TO_REJECT = 3    # ...but never reject on fewer than this many in absolute
+                                        # terms, so a short track with just 1-2 bad pairs (which
+                                        # could easily exceed the fraction above on a small
+                                        # denominator) isn't wrongly discarded
+
+# Overlap detection: two vehicles travelling in OPPOSITE directions that
+# pass close enough together in time can land in the same time-gap group
+# above (segmentation only looks at time gaps, not sign) -- e.g. a
+# westbound car passing just as an eastbound car is still in range. A
+# real single vehicle's raw signed reading should not flip sign under
+# this sensor's road-aligned geometry, so a SUSTAINED sign reversal
+# within one group (not just a sample or two of noise near a magnitude
+# dip at closest approach, which is ordinary) is treated as two
+# overlapping tracks and split apart at the crossing. Tune this if real
+# single-vehicle passes start getting incorrectly split, or genuine
+# overlaps go uncaught.
+MIN_DIRECTION_RUN_SAMPLES = 6
 
 # Kalman/RTS smoother: nearly-constant-acceleration model (state = [velocity,
 # acceleration], process noise on jerk), applied on top of the median-
@@ -143,8 +178,71 @@ def detect_artifact_mask(epochs, raw_kmh):
     return mask
 
 
+def count_implausible_jumps(epochs, raw_kmh):
+    """Number of consecutive raw-sample pairs whose implied acceleration
+    exceeds MAX_PLAUSIBLE_ACCEL_MPS2, checked across the WHOLE track (not
+    just at stuck-run boundaries like detect_artifact_mask() above)."""
+    n = len(raw_kmh)
+    count = 0
+    for i in range(1, n):
+        if _implied_accel_mps2(raw_kmh[i - 1], raw_kmh[i], epochs[i] - epochs[i - 1]) > MAX_PLAUSIBLE_ACCEL_MPS2:
+            count += 1
+    return count
+
+
 def median_filter(values, window=MEDIAN_FILTER_WINDOW):
     return pd.Series(values).rolling(window, center=True, min_periods=1).median().tolist()
+
+
+def split_direction_overlaps(g):
+    """Given one time-contiguous group of raw readings (already segmented
+    by time gap), detect a SUSTAINED sign reversal in the raw kmh values
+    -- the signature of two vehicles travelling in opposite directions
+    whose tracks overlapped closely enough in time that gap-based
+    segmentation alone couldn't separate them (see
+    MIN_DIRECTION_RUN_SAMPLES). A brief flip of just a sample or two right
+    at a magnitude dip is ordinary near-zero noise, not a second vehicle,
+    so both sides of a split must have a solid run of consistent sign
+    before it's treated as a genuine overlap.
+
+    Any brief, weak samples sitting between two solid opposite-sign runs
+    are DROPPED entirely rather than assigned to either side: they're
+    exactly where the two vehicles' signals overlap/cancel, so they
+    aren't reliably either vehicle's true reading, and including them
+    would drag each half's smoothed curve toward a spurious dip/spike at
+    its own edge.
+
+    Returns a list of (sub_dataframe, was_split) pairs: [(g, False)] if no
+    genuine reversal is found (the overwhelmingly common case), or two or
+    more entries with was_split=True if the group was split."""
+    kmh = g["kmh"].tolist()
+    n = len(kmh)
+    if n < 2 * MIN_DIRECTION_RUN_SAMPLES:
+        return [(g, False)]
+
+    signs = [1 if v > 0 else -1 for v in kmh]
+    runs = []  # [sign, start_idx, end_idx_inclusive]
+    start = 0
+    for i in range(1, n + 1):
+        if i == n or signs[i] != signs[start]:
+            runs.append([signs[start], start, i - 1])
+            start = i
+
+    solid = [r for r in runs if (r[2] - r[1] + 1) >= MIN_DIRECTION_RUN_SAMPLES]
+    if len({r[0] for r in solid}) < 2:
+        return [(g, False)]  # everything's one sign, or only brief noise flips
+
+    segments = []  # [(start_idx, end_idx_inclusive), ...]
+    seg_start = 0
+    current_sign = solid[0][0]
+    for i in range(1, len(solid)):
+        if solid[i][0] != current_sign:
+            segments.append((seg_start, solid[i - 1][2]))  # end at prior solid run's own extent
+            seg_start = solid[i][1]                         # resume at this solid run's start
+            current_sign = solid[i][0]
+    segments.append((seg_start, n - 1))
+
+    return [(g.iloc[s:e + 1], True) for s, e in segments]
 
 
 def kalman_filter_velocity(epochs, values, q=KALMAN_JERK_NOISE, r=KALMAN_MEASUREMENT_NOISE):
@@ -291,43 +389,64 @@ def segment_tracks(df):
 
     tracks = []
     for _, g in valid.groupby(group_id):
-        raw_kmh = g["kmh"].tolist()
-        epochs_list = g["epoch"].tolist()
+        for sub_g, was_split in split_direction_overlaps(g):
+            raw_kmh = sub_g["kmh"].tolist()
+            epochs_list = sub_g["epoch"].tolist()
 
-        artifact_mask = detect_artifact_mask(epochs_list, raw_kmh)
-        clean_kmh = [v for v, bad in zip(raw_kmh, artifact_mask) if not bad]
-        clean_epochs = [e for e, bad in zip(epochs_list, artifact_mask) if not bad]
+            n_bad_jumps = count_implausible_jumps(epochs_list, raw_kmh)
+            n_pairs = len(raw_kmh) - 1
+            if n_pairs > 0 and n_bad_jumps >= MIN_IMPLAUSIBLE_JUMPS_TO_REJECT \
+                    and (n_bad_jumps / n_pairs) > MAX_IMPLAUSIBLE_JUMP_FRACTION:
+                continue  # too erratic to be one coherent target - discard the whole segment
 
-        raw_max_abs = max(abs(v) for v in raw_kmh)
-        if clean_kmh:
-            med_kmh = median_filter(clean_kmh)
-            smooth_kmh = rts_smooth_velocity(clean_epochs, med_kmh)
-        else:
-            med_kmh = median_filter(raw_kmh)
-            smooth_kmh = rts_smooth_velocity(epochs_list, med_kmh)
-        max_abs = max(abs(v) for v in smooth_kmh)
-        max_mph = max_abs / KMH_PER_MPH
+            artifact_mask = detect_artifact_mask(epochs_list, raw_kmh)
+            clean_kmh = [v for v, bad in zip(raw_kmh, artifact_mask) if not bad]
+            clean_epochs = [e for e, bad in zip(epochs_list, artifact_mask) if not bad]
 
-        artifact_flag = any(artifact_mask) and (raw_max_abs - max_abs) > (ARTIFACT_MAX_SPEED_IMPACT_MPH * KMH_PER_MPH)
+            raw_max_abs = max(abs(v) for v in raw_kmh)
+            if clean_kmh:
+                med_kmh = median_filter(clean_kmh)
+                smooth_kmh = rts_smooth_velocity(clean_epochs, med_kmh)
+            else:
+                med_kmh = median_filter(raw_kmh)
+                smooth_kmh = rts_smooth_velocity(epochs_list, med_kmh)
+            max_abs = max(abs(v) for v in smooth_kmh)
+            max_mph = max_abs / KMH_PER_MPH
+            # Median of the same final (smoothed, artifact-excluded) speed
+            # series max_mph is drawn from, so the two are directly
+            # comparable - not computed from the raw or intermediate signal.
+            median_abs = float(np.median([abs(v) for v in smooth_kmh]))
+            median_mph = median_abs / KMH_PER_MPH
+            duration_s = float(sub_g["epoch"].max() - sub_g["epoch"].min())
+            # Crude distance estimate: treats the whole track as if it moved
+            # at its median speed for its full duration. Ignores acceleration
+            # within the track and any time before/after the radar's first/
+            # last valid sample, so it's a rough figure, not a precise one.
+            track_distance_ft = median_mph * FT_PER_MPH_S * duration_s
 
-        sign_source = clean_kmh if clean_kmh else raw_kmh
-        n_pos = sum(1 for v in sign_source if v > 0)
-        sign = 1 if n_pos >= len(sign_source) / 2 else -1
+            artifact_flag = any(artifact_mask) and (raw_max_abs - max_abs) > (ARTIFACT_MAX_SPEED_IMPACT_MPH * KMH_PER_MPH)
 
-        obj_type = "pedestrian" if max_mph < PEDESTRIAN_MPH_CUTOFF else "vehicle"
+            sign_source = clean_kmh if clean_kmh else raw_kmh
+            n_pos = sum(1 for v in sign_source if v > 0)
+            sign = 1 if n_pos >= len(sign_source) / 2 else -1
 
-        tracks.append({
-            "start_epoch": float(g["epoch"].min()),
-            "end_epoch": float(g["epoch"].max()),
-            "duration_s": float(g["epoch"].max() - g["epoch"].min()),
-            "n_samples": int(len(g)),
-            "max_kmh": float(max_abs),
-            "max_mph": float(max_mph),
-            "direction": SIGN_LABELS.get(sign, "?"),
-            "type": obj_type,
-            "artifact_flag": artifact_flag,
-            "samples": list(zip(epochs_list, raw_kmh, artifact_mask)),
-        })
+            obj_type = "pedestrian" if max_mph < PEDESTRIAN_MPH_CUTOFF else "vehicle"
+
+            tracks.append({
+                "start_epoch": float(sub_g["epoch"].min()),
+                "end_epoch": float(sub_g["epoch"].max()),
+                "duration_s": duration_s,
+                "n_samples": int(len(sub_g)),
+                "max_kmh": float(max_abs),
+                "max_mph": float(max_mph),
+                "median_mph": float(median_mph),
+                "track_distance_ft": float(track_distance_ft),
+                "direction": SIGN_LABELS.get(sign, "?"),
+                "type": obj_type,
+                "artifact_flag": artifact_flag,
+                "overlap_split": was_split,
+                "samples": list(zip(epochs_list, raw_kmh, artifact_mask)),
+            })
     tracks.sort(key=lambda t: t["start_epoch"])
     for i, t in enumerate(tracks):
         t["idx"] = i  # stable chronological index -- used for /plot/ URLs regardless
@@ -466,6 +585,7 @@ def compute_stats(events):
     t_min = min(e["start_epoch"] for e in events)
     t_max = max(e["start_epoch"] for e in events)
     period_hours = (t_max - t_min) / 3600.0
+    n_days = len({local_datetime_str_ms(e["start_epoch"])[:10] for e in events})
 
     matrix = {d: {ty: 0 for ty in TYPES} for d in DIRECTIONS}
     for e in events:
@@ -484,6 +604,7 @@ def compute_stats(events):
         "t_min": t_min,
         "t_max": t_max,
         "period_hours": period_hours,
+        "n_days": n_days,
         "matrix": matrix,
         "speed_stats": speed_stats,
         "extremes": extremes,

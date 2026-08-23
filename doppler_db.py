@@ -44,19 +44,86 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL,
     max_kmh REAL NOT NULL,
     max_mph REAL NOT NULL,
+    median_mph REAL,
+    track_distance_ft REAL,
     artifact_flag INTEGER NOT NULL,
+    overlap_split INTEGER NOT NULL DEFAULT 0,
     UNIQUE(date, idx_in_day)
 );
 CREATE INDEX IF NOT EXISTS idx_events_date ON events(date);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_events_maxmph ON events(max_mph);
+
+-- Written by batch_match_doppler.py: links a track (events.id) to the
+-- CAMA image(s) that reliably correspond to it, by acquisition-time
+-- matching against cama_images.db. A track can have more than one row
+-- if multiple CAMA frames matched; delta_s is the timing offset used to
+-- judge the match, smallest = best.
+CREATE TABLE IF NOT EXISTS cama_labels (
+    id INTEGER PRIMARY KEY,
+    doppler_event_id INTEGER NOT NULL,
+    cama_id INTEGER NOT NULL,
+    cama_filename TEXT NOT NULL,
+    delta_s REAL NOT NULL,
+    match_field TEXT NOT NULL,
+    UNIQUE(doppler_event_id, cama_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cama_labels_event ON cama_labels(doppler_event_id);
+
+-- Written by batch_match_lidar_doppler.py: links a track (events.id) to
+-- the LIDAR3 gate event that reliably corresponds to it, by acquisition-
+-- time matching against lidar3_events.db. LIDAR-side fields are
+-- denormalized in directly (unlike cama_labels' filename-only pointer)
+-- since lidar3_events.db is a separate database file.
+CREATE TABLE IF NOT EXISTS lidar_labels (
+    id INTEGER PRIMARY KEY,
+    doppler_event_id INTEGER NOT NULL,
+    lidar_event_id INTEGER NOT NULL,
+    lidar_l1_epoch REAL NOT NULL,
+    lidar_l1_local_time TEXT NOT NULL,
+    lidar_direction TEXT NOT NULL,
+    lidar_type TEXT NOT NULL,
+    lidar_match_type TEXT NOT NULL,
+    lidar_speed_avg_mph REAL NOT NULL,
+    lidar_speed_consistency_pct REAL,
+    delta_s REAL NOT NULL,
+    match_field TEXT NOT NULL,
+    dop_compare_field TEXT NOT NULL,
+    speed_diff_mph REAL,
+    UNIQUE(doppler_event_id, lidar_event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_lidar_labels_event ON lidar_labels(doppler_event_id);
 """
+
+
+def _column_exists(conn, table, column):
+    cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+    return column in cols
+
+
+def _migrate_schema(conn):
+    """Add columns to an existing DB created before they existed. Existing
+    rows get NULL until reprocessed (doppler_db_build.py --full backfills
+    them); new rows always populate them via upsert_day()."""
+    changed = False
+    if not _column_exists(conn, "events", "median_mph"):
+        conn.execute("ALTER TABLE events ADD COLUMN median_mph REAL")
+        changed = True
+    if not _column_exists(conn, "events", "track_distance_ft"):
+        conn.execute("ALTER TABLE events ADD COLUMN track_distance_ft REAL")
+        changed = True
+    if not _column_exists(conn, "events", "overlap_split"):
+        conn.execute("ALTER TABLE events ADD COLUMN overlap_split INTEGER NOT NULL DEFAULT 0")
+        changed = True
+    if changed:
+        conn.commit()
 
 
 def get_connection(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate_schema(conn)
     return conn
 
 
@@ -74,12 +141,14 @@ def upsert_day(conn, day_str, source_mtime, source_size, tracks, processed_at):
         conn.executemany(
             """INSERT INTO events
                (date, idx_in_day, start_epoch, end_epoch, duration_s, n_samples,
-                direction, type, max_kmh, max_mph, artifact_flag)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                direction, type, max_kmh, max_mph, median_mph, track_distance_ft,
+                artifact_flag, overlap_split)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (day_str, t["idx"], t["start_epoch"], t["end_epoch"], t["duration_s"],
                  t["n_samples"], t["direction"], t["type"], t["max_kmh"], t["max_mph"],
-                 int(t["artifact_flag"]))
+                 t["median_mph"], t["track_distance_ft"], int(t["artifact_flag"]),
+                 int(t["overlap_split"]))
                 for t in tracks
             ],
         )
@@ -147,6 +216,63 @@ def query_events(conn, date_from=None, date_to=None, min_duration=dc.MIN_TRACK_D
         events = [e for e in events if _in_window(e)]
 
     return events
+
+
+def get_cama_labels(conn, event_ids):
+    """Best (smallest delta_s) CAMA image match for each of the given
+    events.id values. Returns {event_id: {"filename": ..., "delta_s": ...}}
+    for events that have at least one label; events with none are simply
+    absent from the returned dict."""
+    event_ids = [e for e in event_ids if e is not None]
+    if not event_ids:
+        return {}
+    placeholders = ",".join("?" * len(event_ids))
+    rows = conn.execute(
+        f"""SELECT doppler_event_id, cama_filename, delta_s
+            FROM cama_labels
+            WHERE doppler_event_id IN ({placeholders})
+            ORDER BY delta_s ASC""",
+        event_ids,
+    ).fetchall()
+    out = {}
+    for r in rows:
+        eid = r["doppler_event_id"]
+        if eid not in out:  # first row per event_id is the smallest delta_s
+            out[eid] = {"filename": r["cama_filename"], "delta_s": r["delta_s"]}
+    return out
+
+
+def get_lidar_labels(conn, event_ids):
+    """Best (smallest delta_s) LIDAR3 match for each of the given
+    events.id values. Returns {event_id: {...}} for events that have at
+    least one label; events with none are simply absent from the
+    returned dict. lidar_labels lives in this same database (unlike
+    cama_labels' source images, LIDAR match data is fully denormalized
+    in at write time), so no cross-database lookup is needed."""
+    event_ids = [e for e in event_ids if e is not None]
+    if not event_ids:
+        return {}
+    placeholders = ",".join("?" * len(event_ids))
+    rows = conn.execute(
+        f"""SELECT doppler_event_id, lidar_speed_avg_mph, lidar_type,
+                   dop_compare_field, speed_diff_mph, delta_s
+            FROM lidar_labels
+            WHERE doppler_event_id IN ({placeholders})
+            ORDER BY delta_s ASC""",
+        event_ids,
+    ).fetchall()
+    out = {}
+    for r in rows:
+        eid = r["doppler_event_id"]
+        if eid not in out:  # first row per event_id is the smallest delta_s
+            out[eid] = {
+                "speed_avg_mph": r["lidar_speed_avg_mph"],
+                "type": r["lidar_type"],
+                "dop_compare_field": r["dop_compare_field"],
+                "speed_diff_mph": r["speed_diff_mph"],
+                "delta_s": r["delta_s"],
+            }
+    return out
 
 
 def has_day(conn, day_str):
